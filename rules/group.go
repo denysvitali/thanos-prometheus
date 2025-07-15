@@ -16,6 +16,7 @@ package rules
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"slices"
@@ -26,6 +27,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/atomic"
 
 	"github.com/prometheus/prometheus/promql/parser"
@@ -40,6 +42,10 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+)
+
+var (
+	tracer = otel.Tracer("github.com/prometheus/prometheus/rules")
 )
 
 // Group is a set of rules that have a logical relation.
@@ -124,6 +130,20 @@ func NewGroup(o GroupOptions) *Group {
 		evalIterationFunc = DefaultEvalIterationFunc
 	}
 
+	traceEvalItereationFunc := func(ctx context.Context, g *Group, evalTimestamp time.Time) {
+		ctx, span := tracer.Start(ctx, "evalIterationFunc",
+			trace.WithAttributes(
+				attribute.String("group.name", g.name),
+				attribute.String("group.interval", g.interval.String()),
+				attribute.Bool("group.markStale", g.markStale),
+				attribute.Int64("group.lastEvaluation", g.lastEvaluation.Unix()),
+				attribute.Bool("group.shouldRestore", g.shouldRestore),
+			),
+		)
+		defer span.End()
+		evalIterationFunc(ctx, g, evalTimestamp)
+	}
+
 	if opts.Logger == nil {
 		opts.Logger = promslog.NewNopLogger()
 	}
@@ -143,7 +163,7 @@ func NewGroup(o GroupOptions) *Group {
 		terminated:           make(chan struct{}),
 		logger:               opts.Logger.With("file", o.File, "group", o.Name),
 		metrics:              metrics,
-		evalIterationFunc:    evalIterationFunc,
+		evalIterationFunc:    traceEvalItereationFunc,
 		appOpts:              &storage.AppendOptions{DiscardOutOfOrder: true},
 	}
 }
@@ -273,7 +293,7 @@ func (g *Group) run(ctx context.Context) {
 		}
 
 		restoreStartTime := time.Now()
-		g.RestoreForState(restoreStartTime)
+		g.RestoreForState(ctx, restoreStartTime)
 		totalRestoreTimeSeconds := time.Since(restoreStartTime).Seconds()
 		g.metrics.GroupLastRestoreDuration.WithLabelValues(GroupKey(g.file, g.name)).Set(totalRestoreTimeSeconds)
 		g.logger.Debug("'for' state restoration completed", "duration_seconds", totalRestoreTimeSeconds)
@@ -741,9 +761,21 @@ func (g *Group) cleanupStaleSeries(ctx context.Context, ts time.Time) {
 	}
 }
 
+func toKV(lset labels.Labels) []string {
+	kv := make([]string, 0, len(lset))
+	for _, l := range lset {
+		kv = append(kv, fmt.Sprintf("%s=%s", l.Name, l.Value))
+	}
+	return kv
+}
+
 // RestoreForState restores the 'for' state of the alerts
 // by looking up last ActiveAt from storage.
-func (g *Group) RestoreForState(ts time.Time) {
+func (g *Group) RestoreForState(ctx context.Context, ts time.Time) {
+	ctx, span := tracer.Start(ctx, "RestoreForState", trace.WithAttributes(
+		attribute.Int("group.ts", int(ts.Unix())),
+	))
+	defer span.End()
 	maxtMS := int64(model.TimeFromUnixNano(ts.UnixNano()))
 	// We allow restoration only if alerts were active before after certain time.
 	mint := ts.Add(-g.opts.OutageTolerance)
@@ -760,8 +792,13 @@ func (g *Group) RestoreForState(ts time.Time) {
 	}()
 
 	for _, rule := range g.Rules() {
+		ctx, span := tracer.Start(ctx, "evaluateRule", trace.WithAttributes(
+			attribute.String("rule.name", rule.Name()),
+		),
+		)
 		alertRule, ok := rule.(*AlertingRule)
 		if !ok {
+			span.End()
 			continue
 		}
 
@@ -771,11 +808,14 @@ func (g *Group) RestoreForState(ts time.Time) {
 			// like to make it wait for `g.opts.ForGracePeriod` time before firing.
 			// Hence we skip restoration, which will make it wait for alertHoldDuration.
 			alertRule.SetRestored(true)
+			span.End()
 			continue
 		}
 
-		sset, err := alertRule.QueryForStateSeries(g.opts.Context, q)
+		sset, err := alertRule.QueryForStateSeries(ctx, q)
 		if err != nil {
+			span.AddEvent("Failed to restore 'for' state")
+			span.RecordError(err)
 			g.logger.Error(
 				"Failed to restore 'for' state",
 				labels.AlertName, alertRule.Name(),
@@ -785,6 +825,7 @@ func (g *Group) RestoreForState(ts time.Time) {
 			// Even if we failed to query the `ALERT_FOR_STATE` series, we currently have no way to retry the restore process.
 			// So the best we can do is mark the rule as restored and let it eventually fire.
 			alertRule.SetRestored(true)
+			span.End()
 			continue
 		}
 
@@ -794,16 +835,27 @@ func (g *Group) RestoreForState(ts time.Time) {
 			seriesByLabels[sset.At().Labels().DropMetricName().String()] = sset.At()
 		}
 
+		span.SetAttributes(
+			attribute.Int("rule.series_by_labels_count", len(seriesByLabels)),
+		)
+
 		// No results for this alert rule.
 		if len(seriesByLabels) == 0 {
+			span.AddEvent("No series found for alert rule")
 			g.logger.Debug("No series found to restore the 'for' state of the alert rule", labels.AlertName, alertRule.Name())
 			alertRule.SetRestored(true)
+			span.SetAttributes(attribute.Bool("alertRule.restored", true))
+			span.End()
 			continue
 		}
 
 		alertRule.ForEachActiveAlert(func(a *Alert) {
+			_, span := tracer.Start(ctx, "restoreForStateAlert", trace.WithAttributes(
+				attribute.StringSlice("alert.labels", toKV(a.Labels)),
+			),
+			)
+			defer span.End()
 			var s storage.Series
-
 			s, ok := seriesByLabels[a.Labels.String()]
 			if !ok {
 				return
@@ -815,6 +867,7 @@ func (g *Group) RestoreForState(ts time.Time) {
 			for it.Next() == chunkenc.ValFloat {
 				t, v = it.At()
 			}
+			span.RecordError(err)
 			if it.Err() != nil {
 				g.logger.Error("Failed to restore 'for' state",
 					labels.AlertName, alertRule.Name(), "stage", "Iterator", "err", it.Err())
@@ -831,11 +884,13 @@ func (g *Group) RestoreForState(ts time.Time) {
 
 			switch {
 			case timeRemainingPending <= 0:
+				span.AddEvent("timeRemainingPending<=0")
 				// It means that alert was firing when prometheus went down.
 				// In the next Eval, the state of this alert will be set back to
 				// firing again if it's still firing in that Eval.
 				// Nothing to be done in this case.
 			case timeRemainingPending < g.opts.ForGracePeriod:
+				span.AddEvent("timeRemainingPending < g.opts.ForGracePeriod")
 				// (new) restoredActiveAt = (ts + m.opts.ForGracePeriod) - alertHoldDuration
 				//                            /* new firing time */      /* moving back by hold duration */
 				//
@@ -855,15 +910,27 @@ func (g *Group) RestoreForState(ts time.Time) {
 				// Here, some_duration = downDuration.
 				downDuration := ts.Sub(downAt)
 				restoredActiveAt = restoredActiveAt.Add(downDuration)
+				span.SetAttributes(
+					attribute.Int("alert.down_duration_seconds", int(downDuration.Seconds())),
+					attribute.Int("alert.time_remaining_pending_seconds", int(timeRemainingPending.Seconds())),
+				)
 			}
 
 			a.ActiveAt = restoredActiveAt
+			span.SetAttributes(
+				attribute.Int("alert.active_at", int(a.ActiveAt.Unix())),
+			)
+			span.AddEvent("'for' state restored")
 			g.logger.Debug("'for' state restored",
 				labels.AlertName, alertRule.Name(), "restored_time", a.ActiveAt.Format(time.RFC850),
 				"labels", a.Labels.String())
 		})
 
 		alertRule.SetRestored(true)
+		span.SetAttributes(
+			attribute.Bool("alertRule.restored", true),
+		)
+		span.End()
 	}
 }
 

@@ -269,6 +269,8 @@ func (r *AlertingRule) forStateSample(alert *Alert, ts time.Time, v float64) pro
 
 // QueryForStateSeries returns the series for ALERTS_FOR_STATE of the alert rule.
 func (r *AlertingRule) QueryForStateSeries(ctx context.Context, q storage.Querier) (storage.SeriesSet, error) {
+	ctx, span := tracer.Start(ctx, "AlertingRule.QueryForStateSeries")
+	defer span.End()
 	// We use a sample to ease the building of matchers.
 	// Don't provide an alert as we want matchers that match all series for the alert rule.
 	smpl := r.forStateSample(nil, time.Now(), 0)
@@ -282,6 +284,7 @@ func (r *AlertingRule) QueryForStateSeries(ctx context.Context, q storage.Querie
 	})
 
 	sset := q.Select(ctx, false, nil, matchers...)
+	span.RecordError(sset.Err())
 	return sset, sset.Err()
 }
 

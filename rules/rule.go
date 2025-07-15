@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"time"
 
+
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"

@@ -21,6 +21,9 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/annotations"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type sampleAndChunkQueryableClient struct {
@@ -123,6 +126,10 @@ func (c *sampleAndChunkQueryableClient) preferLocalStorage(mint, maxt int64) (cm
 	return cmaxt, false, nil
 }
 
+var (
+	tracer = otel.Tracer("github.com/prometheus/prometheus/storage/remote")
+)
+
 type querier struct {
 	mint, maxt int64
 	client     ReadClient
@@ -139,6 +146,12 @@ type querier struct {
 // If requiredMatchers are given, select returns a NoopSeriesSet if the given matchers don't match the label set of the
 // requiredMatchers. Otherwise it'll just call remote endpoint.
 func (q *querier) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+	ctx, span := tracer.Start(ctx, "remote.Querier.Select",
+		trace.WithAttributes(
+			attribute.Bool("querier.sort", sortSeries),
+		),
+	)
+	defer span.End()
 	if len(q.requiredMatchers) > 0 {
 		// Copy to not modify slice configured by user.
 		requiredMatchers := append([]*labels.Matcher{}, q.requiredMatchers...)
@@ -165,6 +178,9 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, hints *storage.Se
 		return storage.ErrSeriesSet(fmt.Errorf("toQuery: %w", err))
 	}
 
+	span.SetAttributes(
+		attribute.String("querier.query", query.String()),
+	)
 	res, err := q.client.Read(ctx, query, sortSeries)
 	if err != nil {
 		return storage.ErrSeriesSet(fmt.Errorf("remote_read: %w", err))

@@ -460,7 +460,7 @@ func TestForStateRestore(t *testing.T) {
 					if tt.before != nil {
 						tt.before()
 					}
-
+					ctx := context.Background()
 					newRule := NewAlertingRule(
 						"HTTPRequestRateLow",
 						expr,
@@ -485,7 +485,7 @@ func TestForStateRestore(t *testing.T) {
 					// First eval before restoration.
 					newGroup.Eval(context.TODO(), restoreTime)
 					// Restore happens here.
-					newGroup.RestoreForState(restoreTime)
+					newGroup.RestoreForState(ctx, restoreTime)
 
 					got := newRule.ActiveAlerts()
 					for _, aa := range got {
